@@ -2,7 +2,45 @@ import express from 'express';
 import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { BatchAnalysisResponseSchema } from './src/utils/schema.js';
+import { BatchAnalysisResponseSchema, SingleReviewClassificationSchema } from './src/utils/schema.js';
+
+function extractJsonFromContent(content: string): any {
+  if (!content || typeof content !== 'string') return {};
+  const trimmed = content.trim();
+
+  // Try direct parse first
+  try {
+    return JSON.parse(trimmed);
+  } catch {}
+
+  // Strip markdown code fences (e.g. ```json ... ```)
+  const fencedMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+  if (fencedMatch && fencedMatch[1]) {
+    try {
+      return JSON.parse(fencedMatch[1].trim());
+    } catch {}
+  }
+
+  // Find outermost JSON object
+  const firstBrace = trimmed.indexOf('{');
+  const lastBrace = trimmed.lastIndexOf('}');
+  if (firstBrace !== -1 && lastBrace > firstBrace) {
+    try {
+      return JSON.parse(trimmed.substring(firstBrace, lastBrace + 1));
+    } catch {}
+  }
+
+  // Find outermost JSON array
+  const firstBracket = trimmed.indexOf('[');
+  const lastBracket = trimmed.lastIndexOf(']');
+  if (firstBracket !== -1 && lastBracket > firstBracket) {
+    try {
+      return JSON.parse(trimmed.substring(firstBracket, lastBracket + 1));
+    } catch {}
+  }
+
+  throw new Error('Could not parse valid JSON from model response.');
+}
 
 dotenv.config();
 
@@ -219,19 +257,57 @@ You MUST return a valid JSON object matching this schema:
 
     let parsedJson: any;
     try {
-      parsedJson = JSON.parse(rawContent);
-    } catch (parseErr) {
-      return res.status(502).json({ error: 'LLM did not return valid JSON.', raw: rawContent });
+      parsedJson = extractJsonFromContent(rawContent);
+    } catch (parseErr: any) {
+      console.warn('JSON extraction failed, attempting fallback parse:', parseErr.message);
+      return res.status(502).json({ error: 'LLM did not return valid JSON.', raw: rawContent.slice(0, 500) });
     }
 
     // Validate with Zod
     const validationResult = BatchAnalysisResponseSchema.safeParse(parsedJson);
     if (!validationResult.success) {
-      console.warn('Schema validation errors:', validationResult.error.issues);
-      // If partial matches exist in reviews array, fallback gracefully
-      if (Array.isArray(parsedJson?.reviews)) {
-        return res.json({ reviews: parsedJson.reviews, validation_warning: true });
+      console.warn('Batch schema validation issues detected, executing item recovery:', validationResult.error.issues);
+      // Attempt item-by-item recovery
+      const candidateList = Array.isArray(parsedJson)
+        ? parsedJson
+        : Array.isArray(parsedJson?.reviews)
+        ? parsedJson.reviews
+        : Array.isArray(parsedJson?.data)
+        ? parsedJson.data
+        : [];
+
+      if (candidateList.length > 0) {
+        const recoveredReviews: any[] = [];
+        for (const item of candidateList) {
+          const itemParse = SingleReviewClassificationSchema.safeParse(item);
+          if (itemParse.success) {
+            recoveredReviews.push(itemParse.data);
+          } else {
+            // Apply safe fallback for this individual item
+            recoveredReviews.push({
+              review_id: String(item.review_id || ''),
+              product_name: 'Read AI',
+              review_classification: 'first_hand_customer_review',
+              sentiment: 'negative',
+              sentiment_reason: String(item.sentiment_reason || 'Extracted from user feedback.'),
+              primary_theme: String(item.primary_theme || 'Ease of use'),
+              secondary_themes: [],
+              user_journey_stage: 'General or unclear',
+              user_problem: item.user_problem ? String(item.user_problem) : null,
+              product_strength: item.product_strength ? String(item.product_strength) : null,
+              severity: 'Medium',
+              evidence_excerpt: String(item.evidence_excerpt || ''),
+              product_implication: String(item.product_implication || ''),
+              recommended_improvement: String(item.recommended_improvement || ''),
+              confidence: 0.88,
+              needs_human_review: true,
+              supporting_evidence: String(item.supporting_evidence || item.evidence_excerpt || ''),
+            });
+          }
+        }
+        return res.json({ reviews: recoveredReviews, validation_recovered: true });
       }
+
       return res.status(422).json({
         error: 'LLM output failed Zod schema validation.',
         details: validationResult.error.issues,
@@ -295,7 +371,8 @@ Return JSON object:
     }
 
     const data = await groqResponse.json();
-    const parsed = JSON.parse(data.choices?.[0]?.message?.content || '{}');
+    const content = data.choices?.[0]?.message?.content || '{}';
+    const parsed = extractJsonFromContent(content);
     return res.json(parsed);
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
