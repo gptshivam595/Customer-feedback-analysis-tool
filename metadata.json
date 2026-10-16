@@ -1,0 +1,6 @@
+{
+  "name": "Review Intelligence Analyzer",
+  "description": "Turn customer feedback into evidence-backed product insights. Ingest, classify, analyze, and export product reviews with AI.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
